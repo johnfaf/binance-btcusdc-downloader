@@ -142,5 +142,6 @@ if __name__ == "__main__":
         download_1s_klines("BTCUSDC", "futures", 400)
         print("✅ Automated download job completed")
     else:
-        # Normal web server
-        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+        # Run web server
+        port = int(os.getenv("PORT", 8000))
+        uvicorn.run(app, host="0.0.0.0", port=port)
