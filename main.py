@@ -1,35 +1,65 @@
+import asyncio
+import os
+import re
+import sys
+import glob
+import zipfile
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+
+import pandas as pd
+import requests
+import uvicorn
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import HTMLResponse
-import os
-import requests
-import zipfile
-import pandas as pd
-from datetime import datetime, timedelta
-import sys
-import uvicorn
-import glob
 from sqlalchemy import create_engine
 import sqlalchemy as sa
-
-app = FastAPI(title="Binance BTCUSDC 1s Data Manager")
 
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Binance daily 1s kline CSVs are headerless. Without `names=` pandas promotes
+# the first data row to column labels, which is what produced parquet files
+# named "1743811200000000" / "83864.00000000" downstream.
+BINANCE_KLINE_COLUMNS = [
+    "open_time", "open", "high", "low", "close", "volume",
+    "close_time", "quote_volume", "count",
+    "taker_buy_volume", "taker_buy_quote_volume", "ignore",
+]
+
+# How often the auto-scheduler runs. Binance publishes a day's file the next
+# day around 00:30 UTC; checking every 6h is cheap and self-healing.
+AUTO_DOWNLOAD_INTERVAL_HOURS = float(os.getenv("AUTO_DOWNLOAD_INTERVAL_HOURS", "6"))
+AUTO_DOWNLOAD_LOOKBACK_DAYS = int(os.getenv("AUTO_DOWNLOAD_LOOKBACK_DAYS", "400"))
+AUTO_DOWNLOAD_PRODUCTS = [
+    p.strip() for p in os.getenv("AUTO_DOWNLOAD_PRODUCTS", "spot").split(",") if p.strip()
+]
+
+
 # ====================== Core Functions ======================
 
+# Filename pattern: BTCUSDC-1s-YYYY-MM-DD.parquet
+_DATE_FROM_FILENAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.parquet$")
+
+
 def get_existing_dates(product: str, symbol: str):
+    """Return the set of YYYY-MM-DD strings that have a non-empty parquet on disk."""
     dates = set()
     path = f"{DATA_DIR}/{product}/{symbol}"
     if not os.path.exists(path):
         return dates
     for file in os.listdir(path):
-        if file.endswith(".parquet"):
-            try:
-                date_str = file.split("-")[-1].replace(".parquet", "")
-                dates.add(date_str)
-            except:
+        m = _DATE_FROM_FILENAME.search(file)
+        if not m:
+            continue
+        full_path = os.path.join(path, file)
+        # Treat 0/near-zero byte parquets as missing so a partial write retries.
+        try:
+            if os.path.getsize(full_path) < 1024:
                 continue
+        except OSError:
+            continue
+        dates.add(m.group(1))
     return dates
 
 
@@ -76,7 +106,16 @@ def download_1s_klines(symbol="BTCUSDC", product="spot", days=400):
                 with zipfile.ZipFile(save_zip) as z:
                     z.extractall(os.path.dirname(save_zip))
 
-                df = pd.read_csv(csv_path)
+                # Binance writes headerless daily 1s files. Some month-aggregated
+                # files do include a header; sniff the first cell to decide.
+                with open(csv_path, "r") as fh:
+                    first_cell = fh.readline().split(",", 1)[0].strip()
+                has_header = not first_cell.lstrip("-").isdigit()
+                df = pd.read_csv(
+                    csv_path,
+                    header=0 if has_header else None,
+                    names=None if has_header else BINANCE_KLINE_COLUMNS,
+                )
                 parquet_path = save_zip.replace(".zip", ".parquet")
                 df.to_parquet(parquet_path, compression='gzip', index=False)
 
@@ -185,6 +224,50 @@ def import_parquet_to_postgres(product: str, symbol="BTCUSDC"):
         print(f"✅ Imported chunk {i+1}")
 
     print(f"🎉 Successfully imported {product} data into PostgreSQL!")
+
+
+# ====================== Auto-Scheduler ======================
+
+async def _auto_download_loop():
+    """Periodically refresh missing daily files. Sleeps between runs.
+
+    download_1s_klines is sync and blocks. Run it on the default executor so it
+    doesn't stall request handling for the 30-60min a full top-up can take.
+    """
+    interval_s = max(AUTO_DOWNLOAD_INTERVAL_HOURS * 3600, 60.0)
+    while True:
+        for product in AUTO_DOWNLOAD_PRODUCTS:
+            try:
+                print(f"⏰ Auto-download tick: {product} (lookback={AUTO_DOWNLOAD_LOOKBACK_DAYS}d)")
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    download_1s_klines,
+                    "BTCUSDC", product, AUTO_DOWNLOAD_LOOKBACK_DAYS,
+                )
+            except Exception as e:
+                print(f"❌ Auto-download error ({product}): {e}")
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            break
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = asyncio.create_task(_auto_download_loop())
+    print(f"🟢 Auto-download scheduler started "
+          f"(every {AUTO_DOWNLOAD_INTERVAL_HOURS}h, products={AUTO_DOWNLOAD_PRODUCTS})")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Binance BTCUSDC 1s Data Manager", lifespan=lifespan)
 
 
 # ====================== Routes ======================
